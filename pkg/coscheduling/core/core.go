@@ -86,7 +86,8 @@ type PodGroupManager struct {
 	// If podgroup's scheduleTimeoutSeconds is set, it will be used.
 	scheduleTimeout *time.Duration
 	// permittedPG stores the podgroup name which has passed the pre resource check.
-	permittedPG *gocache.Cache
+	permittedPG      *gocache.Cache
+	nominatedNodeSet *gocache.Cache
 	// backedOffPG stores the podgorup name which failed scheduling recently.
 	backedOffPG *gocache.Cache
 	// podLister is pod lister
@@ -102,6 +103,7 @@ func NewPodGroupManager(client client.Client, snapshotSharedLister framework.Sha
 		scheduleTimeout:      scheduleTimeout,
 		podLister:            podInformer.Lister(),
 		permittedPG:          gocache.New(3*time.Second, 3*time.Second),
+		nominatedNodeSet:     gocache.New(3*time.Second, 3*time.Second),
 		backedOffPG:          gocache.New(10*time.Second, 10*time.Second),
 	}
 	return pgMgr
@@ -193,7 +195,11 @@ func (pgMgr *PodGroupManager) PreFilter(ctx context.Context, pod *corev1.Pod) (s
 	// It only tries to PreFilter resource constraints so even if a PodGroup passed here,
 	// it may not necessarily pass Filter due to other constraints such as affinity/taints.
 	if _, ok := pgMgr.permittedPG.Get(pgFullName); ok {
-		return nil, nil
+		var set sets.Set[string]
+		if c, ok := pgMgr.nominatedNodeSet.Get(pgFullName); ok {
+			set = c.(sets.Set[string])
+		}
+		return set, nil
 	}
 
 	nodes, err := pgMgr.snapshotSharedLister.NodeInfos().List()
@@ -216,6 +222,7 @@ func (pgMgr *PodGroupManager) PreFilter(ctx context.Context, pod *corev1.Pod) (s
 		klog.ErrorS(err, "Failed to PreFilter (filterNodes)", "podGroup", klog.KObj(pg))
 		return nil, err
 	}
+	pgMgr.nominatedNodeSet.Add(pgFullName, set, *pgMgr.scheduleTimeout)
 	return set, nil
 }
 
@@ -268,6 +275,7 @@ func (pgMgr *PodGroupManager) GetCreationTimestamp(pod *corev1.Pod, ts time.Time
 // DeletePermittedPodGroup deletes a podGroup that passes Pre-Filter but reaches PostFilter.
 func (pgMgr *PodGroupManager) DeletePermittedPodGroup(pgFullName string) {
 	pgMgr.permittedPG.Delete(pgFullName)
+	pgMgr.nominatedNodeSet.Delete(pgFullName)
 }
 
 // GetPodGroup returns the PodGroup that a Pod belongs to in cache.
