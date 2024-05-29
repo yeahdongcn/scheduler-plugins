@@ -146,6 +146,7 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 		klog.ErrorS(err, "PreFilter failed", "pod", klog.KObj(pod))
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
 	}
+	klog.InfoS("PreFilter passes", "nodeNames", nodeNames, "pod", klog.KObj(pod))
 
 	var result *framework.PreFilterResult = nil
 	if nodeNames != nil {
