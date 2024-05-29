@@ -13,6 +13,7 @@ require (
 	github.com/k8stopologyawareschedwg/podfingerprint v0.2.2
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/paypal/load-watcher v0.2.3
+	github.com/sirupsen/logrus v1.9.0
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.8.4
 	gonum.org/v1/gonum v0.12.0
@@ -91,7 +92,6 @@ require (
 	github.com/prometheus/common v0.44.0 // indirect
 	github.com/prometheus/procfs v0.10.1 // indirect
 	github.com/seccomp/libseccomp-golang v0.10.0 // indirect
-	github.com/sirupsen/logrus v1.9.0 // indirect
 	github.com/spf13/cobra v1.7.0 // indirect
 	github.com/stoewer/go-strcase v1.2.0 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.10 // indirect

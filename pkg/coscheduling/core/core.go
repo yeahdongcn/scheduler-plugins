@@ -27,14 +27,18 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	informerv1 "k8s.io/client-go/informers/core/v1"
 	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
+	resourcehelper "k8s.io/kubernetes/pkg/api/v1/resource"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
+	"sigs.k8s.io/scheduler-plugins/pkg/coscheduling/core/slurm/topology/tree"
 	"sigs.k8s.io/scheduler-plugins/pkg/util"
 )
 
@@ -62,7 +66,7 @@ func (s *PermitState) Clone() framework.StateData {
 
 // Manager defines the interfaces for PodGroup management.
 type Manager interface {
-	PreFilter(context.Context, *corev1.Pod) error
+	PreFilter(context.Context, *corev1.Pod) (sets.Set[string], error)
 	Permit(context.Context, *framework.CycleState, *corev1.Pod) Status
 	GetPodGroup(context.Context, *corev1.Pod) (string, *v1alpha1.PodGroup)
 	GetCreationTimestamp(*corev1.Pod, time.Time) time.Time
@@ -83,7 +87,7 @@ type PodGroupManager struct {
 	scheduleTimeout *time.Duration
 	// permittedPG stores the podgroup name which has passed the pre resource check.
 	permittedPG *gocache.Cache
-	// backedOffPG stores the podgorup name which failed scheudling recently.
+	// backedOffPG stores the podgorup name which failed scheduling recently.
 	backedOffPG *gocache.Cache
 	// podLister is pod lister
 	podLister listerv1.PodLister
@@ -158,43 +162,43 @@ func (pgMgr *PodGroupManager) ActivateSiblings(pod *corev1.Pod, state *framework
 // 1. it belongs to a podgroup that was recently denied or
 // 2. the total number of pods in the podgroup is less than the minimum number of pods
 // that is required to be scheduled.
-func (pgMgr *PodGroupManager) PreFilter(ctx context.Context, pod *corev1.Pod) error {
+func (pgMgr *PodGroupManager) PreFilter(ctx context.Context, pod *corev1.Pod) (sets.Set[string], error) {
 	klog.V(5).InfoS("Pre-filter", "pod", klog.KObj(pod))
 	pgFullName, pg := pgMgr.GetPodGroup(ctx, pod)
 	if pg == nil {
-		return nil
+		return nil, nil
 	}
 
 	if _, exist := pgMgr.backedOffPG.Get(pgFullName); exist {
-		return fmt.Errorf("podGroup %v failed recently", pgFullName)
+		return nil, fmt.Errorf("podGroup %v failed recently", pgFullName)
 	}
 
 	pods, err := pgMgr.podLister.Pods(pod.Namespace).List(
 		labels.SelectorFromSet(labels.Set{v1alpha1.PodGroupLabel: util.GetPodGroupLabel(pod)}),
 	)
 	if err != nil {
-		return fmt.Errorf("podLister list pods failed: %w", err)
+		return nil, fmt.Errorf("podLister list pods failed: %w", err)
 	}
 
 	if len(pods) < int(pg.Spec.MinMember) {
-		return fmt.Errorf("pre-filter pod %v cannot find enough sibling pods, "+
+		return nil, fmt.Errorf("pre-filter pod %v cannot find enough sibling pods, "+
 			"current pods number: %v, minMember of group: %v", pod.Name, len(pods), pg.Spec.MinMember)
 	}
 
 	if pg.Spec.MinResources == nil {
-		return nil
+		return nil, nil
 	}
 
 	// TODO(cwdsuzhou): This resource check may not always pre-catch unschedulable pod group.
 	// It only tries to PreFilter resource constraints so even if a PodGroup passed here,
 	// it may not necessarily pass Filter due to other constraints such as affinity/taints.
 	if _, ok := pgMgr.permittedPG.Get(pgFullName); ok {
-		return nil
+		return nil, nil
 	}
 
 	nodes, err := pgMgr.snapshotSharedLister.NodeInfos().List()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	minResources := pg.Spec.MinResources.DeepCopy()
@@ -202,11 +206,17 @@ func (pgMgr *PodGroupManager) PreFilter(ctx context.Context, pod *corev1.Pod) er
 	minResources[corev1.ResourcePods] = *podQuantity
 	err = CheckClusterResource(ctx, nodes, minResources, pgFullName)
 	if err != nil {
-		klog.ErrorS(err, "Failed to PreFilter", "podGroup", klog.KObj(pg))
-		return err
+		klog.ErrorS(err, "Failed to PreFilter (CheckClusterResource)", "podGroup", klog.KObj(pg))
+		return nil, err
 	}
 	pgMgr.permittedPG.Add(pgFullName, pgFullName, *pgMgr.scheduleTimeout)
-	return nil
+
+	set, err := pgMgr.filterNodes(ctx, nodes, pgFullName, pg, pod)
+	if err != nil {
+		klog.ErrorS(err, "Failed to PreFilter (filterNodes)", "podGroup", klog.KObj(pg))
+		return nil, err
+	}
+	return set, nil
 }
 
 // Permit permits a pod to run, if the minMember match, it would send a signal to chan.
@@ -291,6 +301,97 @@ func (pgMgr *PodGroupManager) CalculateAssignedPods(podGroupName, namespace stri
 	}
 
 	return count
+}
+
+func (pgMgr *PodGroupManager) filterNodes(
+	ctx context.Context,
+	nodeList []*framework.NodeInfo,
+	desiredPodGroupName string, desiredPodGroup *v1alpha1.PodGroup,
+	pod *corev1.Pod) (sets.Set[string], error) {
+	// 1. Get the nodes that match the nodeSelector of the pod.
+	labelSelector := labels.NewSelector()
+	for k, v := range pod.Spec.NodeSelector {
+		requirement, err := labels.NewRequirement(k, selection.Equals, []string{v})
+		if err != nil {
+			klog.ErrorS(err, "Failed to create label requirement", "key", k, "value", v)
+			continue
+		}
+		labelSelector = labelSelector.Add(*requirement)
+	}
+	list := &corev1.NodeList{}
+	pgMgr.client.List(ctx, list, &client.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	lookup := make(map[string]struct{})
+	for _, node := range list.Items {
+		lookup[node.Name] = struct{}{}
+	}
+	// XXX: If the nodeSelector is not satisfied, return nil.
+	if len(lookup) == 0 {
+		return nil, nil
+	}
+
+	// 2. Check if the resource of the node can satisfy the pod.
+	resourceAvailableLookup := make(map[string]struct{})
+	resourceRequest := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
+	for _, info := range nodeList {
+		if info == nil || info.Node() == nil {
+			continue
+		}
+
+		nodeResource := util.ResourceList(getNodeResource(ctx, info, desiredPodGroupName))
+		add := true
+		for name, quant := range resourceRequest {
+			quant.Sub(nodeResource[name])
+			if quant.Sign() > 0 {
+				add = false
+				break
+			}
+		}
+		if add {
+			if _, ok := lookup[info.Node().Name]; ok {
+				resourceAvailableLookup[info.Node().Name] = struct{}{}
+			}
+		}
+	}
+	// XXX: If the resource is not satisfied, return nil.
+	if len(resourceAvailableLookup) == 0 {
+		return nil, nil
+	}
+
+	// 3. Get the nodes that match the taints of the pod.
+
+	// 4. Get the nodes that match the affinity of the pod.
+
+	// 5. Get the nodes that match the anti-affinity of the pod.
+
+	err := tree.SwitchRecordValidate(tree.DefaultConfigPath)
+	if err != nil {
+		klog.ErrorS(err, "Failed to validate switch records", "configPath", tree.DefaultConfigPath)
+		return nil, err
+	}
+
+	requested := uint32(desiredPodGroup.Spec.MinMember + desiredPodGroup.Spec.MinMember/10)
+	if desiredPodGroup.Spec.MinMember%10 > 0 {
+		requested += 1
+	}
+	availableNodes := []string{}
+	for node := range resourceAvailableLookup {
+		availableNodes = append(availableNodes, node)
+	}
+	selectedNodes, leafSwitchCount, err := tree.EvalNodesTree(availableNodes, []string{}, requested)
+	if err != nil {
+		klog.ErrorS(err, "Failed to evaluate nodes tree")
+		return nil, err
+	}
+	klog.InfoS("Evaluated nodes tree", "selectedNodes", selectedNodes, "leafSwitchCount", leafSwitchCount)
+
+	set := sets.Set[string]{}
+	for _, node := range selectedNodes {
+		set.Insert(node)
+	}
+
+	return set, nil
 }
 
 // CheckClusterResource checks if resource capacity of the cluster can satisfy <resourceRequest>.

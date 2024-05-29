@@ -180,7 +180,7 @@ func TestPreFilter(t *testing.T) {
 				podInformer.Informer().GetStore().Add(p)
 			}
 
-			err = pgMgr.PreFilter(ctx, tt.pod)
+			_, err = pgMgr.PreFilter(ctx, tt.pod)
 			if (err == nil) != tt.expectedSuccess {
 				t.Errorf("Want %v, but got %v", tt.expectedSuccess, err == nil)
 			}

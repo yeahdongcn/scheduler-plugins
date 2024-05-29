@@ -141,11 +141,20 @@ func (cs *Coscheduling) Less(podInfo1, podInfo2 *framework.QueuedPodInfo) bool {
 func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	// If PreFilter fails, return framework.UnschedulableAndUnresolvable to avoid
 	// any preemption attempts.
-	if err := cs.pgMgr.PreFilter(ctx, pod); err != nil {
+	nodeNames, err := cs.pgMgr.PreFilter(ctx, pod)
+	if err != nil {
 		klog.ErrorS(err, "PreFilter failed", "pod", klog.KObj(pod))
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
 	}
-	return nil, framework.NewStatus(framework.Success, "")
+
+	var result *framework.PreFilterResult = nil
+	if nodeNames != nil {
+		result = &framework.PreFilterResult{
+			NodeNames: nodeNames,
+		}
+	}
+
+	return result, framework.NewStatus(framework.Success, "")
 }
 
 // PostFilter is used to reject a group of pods if a pod does not pass PreFilter or Filter.
