@@ -328,8 +328,10 @@ func (pgMgr *PodGroupManager) filterNodes(
 	}
 	// XXX: If the nodeSelector is not satisfied, return nil.
 	if len(lookup) == 0 {
+		klog.InfoS("No nodes match the nodeSelector", "nodeSelector", pod.Spec.NodeSelector)
 		return nil, nil
 	}
+	klog.InfoS("Nodes match the nodeSelector", "nodeSelector", pod.Spec.NodeSelector, "nodes", lookup)
 
 	// 2. Check if the resource of the node can satisfy the pod.
 	resourceAvailableLookup := make(map[string]struct{})
@@ -356,8 +358,10 @@ func (pgMgr *PodGroupManager) filterNodes(
 	}
 	// XXX: If the resource is not satisfied, return nil.
 	if len(resourceAvailableLookup) == 0 {
+		klog.InfoS("No nodes have enough resource", "resourceRequest", resourceRequest)
 		return nil, nil
 	}
+	klog.InfoS("Nodes have enough resource", "resourceRequest", resourceRequest, "nodes", resourceAvailableLookup)
 
 	// 3. Get the nodes that match the taints of the pod.
 
